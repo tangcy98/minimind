@@ -1,3 +1,4 @@
+"""API 客户端示例：把多轮对话发送到本地 OpenAI 兼容聊天服务。"""
 from openai import OpenAI
 
 client = OpenAI(

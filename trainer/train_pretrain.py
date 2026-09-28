@@ -1,3 +1,9 @@
+"""预训练入口：从文本数据训练模型预测下一个 token。
+
+阅读重点：train_epoch 展示单个 batch 的完整参数更新；文件末尾 main
+负责组装数据、模型、优化器和设备。预训练通常没有问答标签，而是让模型
+从连续文本学习语言规律与知识表征。
+"""
 import os
 import sys
 
@@ -22,6 +28,11 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    """遍历一个 epoch 的 batch 并执行前向、反向和参数更新。
+
+    epoch 是完整遍历训练集一次；step 是其中一个 batch。batch 是同时送入
+    模型的一组样本；optimizer（优化器）根据 loss 梯度更新权重。
+    """
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
@@ -30,17 +41,27 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # autocast 是混合精度上下文：部分算子用较低精度减少显存/提升速度。
+        # float16 梯度缩放器 scaler 在反向与更新处保护小梯度不下溢。
         with autocast_ctx:
+            # forward 内部将 logits 与右移一位的 labels 做交叉熵；
+            # MoE 模型还会产生负载均衡 aux_loss。按累积步数缩放后再反传。
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
+        # backward（反向传播）沿计算图用链式法则计算 loss 对参数的梯度。
+        # 梯度累积时多个 batch 先累加梯度，再统一做一次 optimizer 更新。
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0 or step == iters:
+            # 梯度累积相当于扩大有效 batch；更新前先还原缩放并裁剪梯度，
+            # 再执行 AdamW 更新。最后一个不满累积窗口的 batch 也会更新。
+            # gradient clipping（梯度裁剪）限制梯度范数，减少异常大梯度导致的不稳定。
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
+            # AdamW 是带权重衰减的自适应梯度优化器；step 用累积梯度更新参数。
             scaler.step(optimizer)
             scaler.update()
 
@@ -98,6 +119,10 @@ if __name__ == "__main__":
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
+    # 阅读提示：这里按“运行环境 → 模型/数据/优化器 → 恢复状态 → 并行包装 → epoch”
+    # 组织训练生命周期。要理解一个训练 step，可先看 train_epoch，再回到这里看其依赖如何构造。
+    # DDP（分布式数据并行）让多个进程处理不同数据分片、各持一份模型副本，
+    # 并在反向传播时同步梯度；单卡运行时不会启用通信组。
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"

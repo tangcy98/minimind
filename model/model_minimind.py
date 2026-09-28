@@ -1,3 +1,10 @@
+"""MiniMind 的 Decoder-only 因果语言模型实现。
+
+Decoder-only 指模型只用 Transformer 解码器堆栈、不含独立编码器；
+因果（autoregressive，自回归）指每个位置只能利用当前及之前的 token，
+逐步预测下一个 token。主链路为 token id → embedding → 多层 block →
+词表 logits。训练和生成共用同一套参数，只是 forward 是否传 labels / KV cache 不同。
+"""
 import math, torch, torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
@@ -8,6 +15,12 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 #                                     MiniMind Config
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class MiniMindConfig(PretrainedConfig):
+    """模型配置（configuration）：描述结构和行为的超参数，不是训练得到的权重。
+
+    hidden_size 是隐状态/embedding 宽度 H；num_hidden_layers 是 block 层数；
+    num_attention_heads 是 Query 头数；num_key_value_heads 是 Key/Value 头数。
+    这些尺寸必须和 checkpoint 中各参数张量的形状一致。
+    """
     model_type = "minimind"
     def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
         super().__init__(**kwargs)
@@ -48,6 +61,7 @@ class MiniMindConfig(PretrainedConfig):
 #                                     MiniMind Model
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class RMSNorm(torch.nn.Module):
+    """RMSNorm（均方根归一化）：按特征向量的均方根缩放，稳定层间数值范围。"""
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -57,9 +71,14 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # 在 FP32 中计算平方均值，降低低精度训练时归一化的数值误差，
+        # 最后再转回输入 dtype，以便继续走混合精度计算。
         return (self.weight * self.norm(x.float())).type_as(x)
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
+    # RoPE（旋转位置编码）不把位置向量加到 hidden state，而是旋转注意力的 Q/K，
+    # 使点积能反映相对位置。这里预计算每个位置的 cos/sin，避免每层重复计算。
+    # YaRN 是长上下文外推方法：平滑缩放频率，帮助模型适配超出训练长度的位置。
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
     if rope_scaling is not None: # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
@@ -89,6 +108,11 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
 class Attention(nn.Module):
+    """多头因果自注意力：让每个 token 从可见的前序 token 汇集上下文信息。
+
+    Query (Q) 表示当前位置要查询什么，Key (K) 表示各位置可被怎样匹配，
+    Value (V) 是匹配后汇总的信息。attention head（注意力头）是并行的子空间。
+    """
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
@@ -109,6 +133,9 @@ class Attention(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # x=[B,S,H]，B=batch（样本数），S=序列长度，H=隐藏维度。
+        # 投影成 Q/K/V 后 reshape 为 [B,S,头数,每头维度]，便于各头独立算相似度。
+        # GQA（分组查询注意力）让多个 Q 头共享一组 K/V 头，降低 KV cache 的内存。
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
@@ -118,10 +145,15 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
         if past_key_value is not None:
+            # KV cache（键值缓存）保存历史 token 的 K/V。自回归解码每次只输入新 token，
+            # 拼接缓存即可看到完整前缀，避免重复计算旧 token 的投影。
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
+        # 转成 [B,heads,S,D] 后，QKᵀ 得到每个 query 对各 key 的注意力分数。
+        # 因果 mask 将未来位置分数设为 -∞，softmax 后概率为 0；padding mask
+        # 再屏蔽补齐 token。满足条件时调用 PyTorch 的 fused SDPA 内核加速。
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
@@ -134,6 +166,7 @@ class Attention(nn.Module):
         return output, past_kv
 
 class FeedForward(nn.Module):
+    """逐位置前馈网络：独立变换每个位置的特征，不在 token 之间传递信息。"""
     def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
         super().__init__()
         intermediate_size = intermediate_size or config.intermediate_size
@@ -143,9 +176,12 @@ class FeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # SwiGLU（门控线性单元变体）：一个投影经 SiLU 激活后作为门，
+        # 与另一投影逐元素相乘，再降回 H 维。门控让模型学习哪些特征该通过。
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class MOEFeedForward(nn.Module):
+    """MoE（专家混合）前馈层：用路由器为每个 token 选择少数专家参与计算。"""
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
@@ -154,6 +190,9 @@ class MOEFeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # router（路由器）给每个 token 对各 expert（专家网络）打分，top-k 决定实际参与者。
+        # 稀疏激活降低每个 token 的计算量，但所有专家参数仍都存于模型中。
+        # aux_loss（辅助负载均衡损失）鼓励 token 分散到专家，避免少数专家过载/闲置。
         batch_size, seq_len, hidden_dim = x.shape
         x_flat = x.view(-1, hidden_dim)
         scores = F.softmax(self.gate(x_flat), dim=-1)
@@ -189,6 +228,9 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # Pre-Norm（先归一化再计算）配合 residual connection（残差连接）：
+        # 将输入直接加回子层输出，给梯度提供短路径。注意力跨 token 混合信息，
+        # MLP/MoE 在每个 token 内变换特征，两者构成一个 Transformer block。
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
@@ -212,6 +254,8 @@ class MiniMindModel(nn.Module):
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+        # embedding（词嵌入）把离散 token id 查成可学习向量 [B,S,H]。
+        # hidden state（隐状态）是这些向量经过 block 更新后的上下文表示。
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
@@ -223,6 +267,8 @@ class MiniMindModel(nn.Module):
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
+        # 每层都接收相同的位置编码切片和自己那层的历史 cache。
+        # presents 按层收集新 cache，供 generate 的下一步增量解码复用。
         for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present = layer(
                 hidden_states,
@@ -237,6 +283,7 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    """因果语言模型外壳：将隐状态投影到词表，并提供训练 loss 与生成协议。"""
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     def __init__(self, config: MiniMindConfig = None):
@@ -250,9 +297,16 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # lm_head 是 H→V 的线性投影。logits_to_keep 可只返回末尾若干位置，
+        # 推理时常用于减少完整上下文的词表投影开销。
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # logits（未归一化分数）形状 [B,S,V]；V 是词表大小。softmax 可将它们
+        # 转成下一个 token 的概率分布，生成时再从分布中选/采样 token。
         loss = None
         if labels is not None:
+            # 交叉熵（cross entropy）度量预测分布与正确 token 的差距。
+            # 右移 labels 建立“位置 t 预测 t+1”；ignore_index=-100 是忽略标签，
+            # 用于 padding 或不应监督的位置。数据集负责设置这些标签。
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)

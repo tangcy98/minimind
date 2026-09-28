@@ -1,3 +1,8 @@
+"""工具调用评估脚本：测试模型生成工具请求、解析参数并完成工具交互的能力。
+
+Tool calling 是模型输出结构化行动请求、由宿主程序执行并把结果回传给模型的模式；
+脚本覆盖本地模型与 OpenAI 兼容服务两种调用路径。
+"""
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))

@@ -1,3 +1,8 @@
+"""模型格式转换入口：在 MiniMind 原生权重、Transformers 及兼容模型结构间导入/导出。
+
+转换通常重排配置或参数名称，并不等于重新训练；转换前后应核对模型结构、
+词表和参数形状是否兼容。
+"""
 import os
 import sys
 import json

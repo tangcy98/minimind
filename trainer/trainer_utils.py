@@ -1,5 +1,7 @@
-"""
-训练工具函数集合
+"""训练公共工具：随机种子、学习率、分布式初始化、模型加载和 checkpoint 管理。
+
+Checkpoint（检查点）是训练状态快照：纯模型权重可以用于推理；resume checkpoint
+还包含优化器、训练进度等状态，方便从中断处继续。
 """
 import os
 import sys
@@ -40,10 +42,12 @@ def Logger(content):
 
 
 def get_lr(current_step, total_steps, lr):
+    # 平滑余弦衰减，并保留最低学习率比例 0.1；它是训练脚本的共享调度策略。
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 
 def init_distributed_mode():
+    """根据 torchrun 注入的环境变量初始化 DDP 通信组，返回当前 GPU 序号。"""
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
 
@@ -63,6 +67,8 @@ def setup_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+    # 同时维护可用于推理的轻量权重和可续训状态。后者还保存优化器、
+    # epoch/step、scaler 等状态；只保存模型参数不能精确接着原训练继续。
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
@@ -119,6 +125,8 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+    # 统一模型/Tokenizer 初始化入口。from_weight='none' 表示随机初始化，
+    # 其他值按约定从 save_dir 读取阶段权重，strict=False 允许少量结构差异。
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniMindForCausalLM(lm_config)
 
@@ -134,6 +142,7 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
 
 
 class SkipBatchSampler(Sampler):
+    """跳过已完成的 batch，配合 resume checkpoint 恢复 epoch 内训练进度。"""
     def __init__(self, sampler, batch_size, skip_batches=0):
         self.sampler = sampler
         self.batch_size = batch_size
@@ -160,6 +169,7 @@ class SkipBatchSampler(Sampler):
 
 
 class LMForRewardModel:
+    """奖励模型封装：把对话上下文和候选回答映射为一个标量偏好分数。"""
     def __init__(self, model_path, device="cuda", dtype=torch.float16):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
@@ -168,6 +178,8 @@ class LMForRewardModel:
 
     @torch.no_grad()
     def get_score(self, messages, response):
+        # 奖励模型把“对话上下文 + 候选回答”压成一个标量分数；
+        # PPO/GRPO 再用这个分数构造策略更新信号，而不是直接拟合 token 标签。
         history_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages[:-1]])
         last_query = messages[-1]['content'] if messages else ""
         message_context = f"{history_text}\n以上是对话历史。我的新问题是：\n{last_query}" if history_text else last_query

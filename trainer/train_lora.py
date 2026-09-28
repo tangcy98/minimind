@@ -1,3 +1,8 @@
+"""LoRA 微调训练入口：冻结预训练主干，只优化插入的低秩适配参数。
+
+LoRA（Low-Rank Adaptation，低秩适配）用两个较小矩阵的乘积近似权重增量，
+以较少可训练参数适配新任务。训练数据和 next-token 目标仍沿用 SFT。
+"""
 import os
 import sys
 
@@ -23,6 +28,7 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
+    """只对传入的 LoRA 参数求梯度和更新，基础模型权重保持冻结。"""
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)

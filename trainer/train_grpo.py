@@ -1,3 +1,9 @@
+"""GRPO/CISPO 在线策略优化入口：组内采样回答、评分并更新语言模型策略。
+
+GRPO（Group Relative Policy Optimization，组相对策略优化）为同一 prompt
+采样一组回答，用组内相对奖励估计优势，不需单独训练 Critic。
+CISPO 是另一种 token 级重要性权重裁剪目标，可通过 loss_type 选择。
+"""
 import os
 import sys
 
@@ -35,6 +41,8 @@ def rep_penalty(text, n=3, cap=0.5):
 
 
 def calculate_rewards(prompts, responses, reward_model):
+    # 奖励由规则项和 reward model 分数组成。GRPO 的关键不是绝对分值，
+    # 而是同一 prompt 下多条回答的相对排名（组内标准化优势）。
     rewards = torch.zeros(len(responses), device=args.device)
 
     with torch.no_grad():
@@ -69,6 +77,7 @@ def calculate_rewards(prompts, responses, reward_model):
 
 
 def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model, start_step=0, wandb=None, use_sglang=False):
+    """执行采样、奖励归一化、token 级损失计算和策略更新。"""
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch['prompt']  # list[str], length B
         prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False,
@@ -77,6 +86,8 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -args.max_seq_len:]
 
+        # 一轮更新分两段：先用当前策略无梯度采样并评分，再重算 log-prob 求梯度。
+        # rollout 引擎返回生成 token、mask 和旧策略 log-prob，训练目标只覆盖 completion。
         rollout_result = rollout_engine.rollout(
             prompt_ids=prompt_inputs["input_ids"],
             attention_mask=prompt_inputs["attention_mask"],
@@ -87,9 +98,13 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         outputs = rollout_result.output_ids
         completion_ids = rollout_result.completion_ids
         completions = rollout_result.completions
+        # outputs=[B*num_gen, P+R]，completion_ids=[B*num_gen,R]；
+        # old_per_token_logps 保存采样策略对 R 个回答 token 的 log π_old。
         old_per_token_logps = rollout_result.per_token_logps.to(args.device).detach()
         prompt_lens = rollout_result.prompt_lens.to(args.device)
         full_mask = (outputs != tokenizer.pad_token_id).long()
+        # 自回归 logit 在 token 位置之前预测该 token，所以 completion 第 j 个 token
+        # 对应 outputs 的位置 prompt_len+j，其 logit 位置再减 1。
         logp_pos = prompt_lens.unsqueeze(1) - 1 + torch.arange(completion_ids.size(1), device=args.device).unsqueeze(0)
         full_mask.scatter_(1, logp_pos + 1, rollout_result.completion_mask.to(args.device, dtype=full_mask.dtype))
 
@@ -98,6 +113,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         with autocast_ctx:
             res = model(outputs, attention_mask=full_mask)
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
+            # 对完整序列求出实际 token 的 log-prob，再按 logp_pos 取出回答区间。
             per_token_logps = F.log_softmax(res.logits[:, :-1, :], dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1).gather(1, logp_pos)
 
         with torch.no_grad():
@@ -121,14 +137,24 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
         std_r = grouped_rewards.std(dim=1, unbiased=False).repeat_interleave(args.num_generations)  # [B*num_gen]
+        # advantage（优势）估计回答比基线好/差多少。每组按同一 prompt 标准化，
+        # 奖励高于组均值的回答为正优势，
+        # 低于均值的为负优势；这让训练不依赖不同 prompt 奖励尺度可比。
         advantages = (rewards - mean_r) / (std_r + 1e-4)  # [B*num_gen]
 
         completion_pad_mask = rollout_result.completion_mask.to(args.device).bool()
+        # completion_mask 排除 padding，并在 EOS（结束标记）处截断回答；
+        # 后续所有 token 级奖励和概率损失都乘这个 mask，避免补齐 token 影响平均值。
         is_eos = (completion_ids == tokenizer.eos_token_id) & completion_pad_mask  # [B*num_gen, R]
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1) - 1, dtype=torch.long, device=args.device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         completion_mask = ((torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)) & completion_pad_mask).int()  # [B*num_gen, R]
 
+        # KL 近似约束新策略不要偏离冻结 reference；ratio 比较新旧策略，
+        # GRPO 用 PPO 式裁剪，CISPO 则对重要性权重截断。
+        # 这里用 exp(log π_ref - log π) - (log π_ref - log π) - 1 作为非负 KL 近似。
+        # ratio = π_new/π_old 是重要性采样比率：轨迹由旧策略采样，却用新策略更新时，
+        # 它校正两种策略对该 token 的概率差。裁剪限制单次策略变化。
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]
         ratio = torch.exp(per_token_logps - old_per_token_logps)  # [B*num_gen, R]

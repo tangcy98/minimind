@@ -1,3 +1,9 @@
+"""PPO 在线强化学习入口：Actor 生成回答，Critic 估计价值并协同训练。
+
+PPO（Proximal Policy Optimization，近端策略优化）通过裁剪新旧策略概率比
+限制一次更新的幅度。Actor 是生成策略；Critic 估计状态价值；reference policy
+是冻结参考模型，负责 KL 正则，三者职责不同。
+"""
 import os
 import sys
 
@@ -34,6 +40,7 @@ def rep_penalty(text, n=3, cap=0.5):
 
 # 自定义的Critic模型，继承自MiniMindLM
 class CriticModel(MiniMindForCausalLM):
+    """Critic 在每个 token 位置估计状态价值 V(s)，不负责生成词表 logits。"""
     def __init__(self, params):
         super().__init__(params)
         # lm_head 不参与 forward，仅靠 tie_word_embeddings 与 embed_tokens 共享权重，解绑后 DDP 会报未使用参数
@@ -49,6 +56,8 @@ class CriticModel(MiniMindForCausalLM):
 
 
 def calculate_rewards(prompts, responses, reward_model):
+    # 将可编程规则（长度、思考格式、重复惩罚）与偏好模型分数合成奖励。
+    # 先理解奖励的来源，再看 PPO 如何把序列级奖励分配到 token 级优势。
     rewards = torch.zeros(len(responses), device=args.device)
 
     with torch.no_grad():
@@ -76,6 +85,7 @@ def calculate_rewards(prompts, responses, reward_model):
 
 
 def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_scheduler, critic_scheduler, reward_model, start_step=0, wandb=None):
+    """先采样并评分，再用 Actor/Critic 多轮拟合该批轨迹。"""
     actor_model.train()
     critic_model.train()
     grad_accum_step = 0
@@ -85,6 +95,8 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=args.max_seq_len,
                         padding_side="left").to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
 
+        # rollout 是采样阶段，需保留旧策略概率；后续 actor 更新按 PPO 多轮优化，
+        # critic 学习价值基线，reference 提供 KL 正则。
         rollout_result = rollout_engine.rollout(
             prompt_ids=enc.input_ids,
             attention_mask=enc.attention_mask,
@@ -127,16 +139,22 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         resp_policy_mask = ((resp_idx < resp_lengths.unsqueeze(1)) & resp_pad_mask).float()
         resp_value_mask = resp_policy_mask.clone()
 
+        # rollout 时冻结计算图得到行为策略概率与旧价值；trajectory（轨迹）是
+        # prompt、模型生成 token、奖励和价值组成的一次交互记录。
         with torch.no_grad():  # Rollout阶段只需推理获取old_logp和old_values，切断梯度省显存
             critic_for_rollout = critic_model.module if isinstance(critic_model, DistributedDataParallel) else critic_model
             values_seq = critic_for_rollout(input_ids=gen_out, attention_mask=full_mask)
             old_resp_values = values_seq.gather(1, logp_pos) * resp_value_mask
             
             ref_resp_logp = F.log_softmax(ref_model(input_ids=gen_out, attention_mask=full_mask).logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1).gather(1, logp_pos)
+            # reward model 给整条回答一个序列级分数；将它放在最后一个有效回答 token，
+            # 让 GAE 递推把最终结果向前传播到较早动作。
             token_rewards = torch.zeros_like(old_resp_logp)
             last_idx = resp_lengths - 1  # [B]
             token_rewards[torch.arange(B, device=args.device)[valid_resp], last_idx[valid_resp]] += rewards[valid_resp]  # 末尾加外部奖励
 
+            # GAE（广义优势估计）用 TD 残差的折扣和估计每个 token 的 advantage，
+            # gamma 控制未来奖励折扣，lam 控制偏差/方差折衷；return 是价值学习目标。
             gen_len = old_resp_values.size(1); lastgaelam = torch.zeros(B, device=args.device); advs_rev = []
             for t in reversed(range(gen_len)):
                 nv = old_resp_values[:, t + 1] if t < gen_len - 1 else 0.0
@@ -203,6 +221,8 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
                             / resp_policy_mask[inds].sum().clamp(min=1))
                 kl_ref_penalty = ((torch.exp(ref_resp_logp[inds] - mb_resp_logp) - (ref_resp_logp[inds] - mb_resp_logp) - 1.0)
                                   * resp_policy_mask[inds]).sum() / resp_policy_mask[inds].sum().clamp(min=1)
+                # PPO clipped objective：同时计算未裁剪和裁剪后的策略目标，取更保守的一项。
+                # value_loss 对 Critic 估计做类似裁剪，vf_coef 平衡 Actor 与 Critic 损失。
                 policy_loss = ((torch.max(-advantages[inds] * ratio,
                                           -advantages[inds] * torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon))
                                * resp_policy_mask[inds]).sum() / resp_policy_mask[inds].sum().clamp(min=1)

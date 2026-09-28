@@ -1,3 +1,9 @@
+"""Tokenizer 训练示例：从语料学习 BPE 子词词表并导出 tokenizer 文件。
+
+Tokenizer（分词器）将字符串切为 token（模型使用的离散符号），再映射成整数 id。
+BPE（Byte Pair Encoding，字节对编码）反复合并语料中高频相邻片段。
+MiniMind 已提供兼容词表；更换词表会破坏 token id 与 embedding 行的对应关系。
+"""
 # 注：不建议再重复训练tokenizer（“词典”），MiniMind已自带，此脚本仅供学习和参考。基于不同词典训练的模型将导致输出完全不统一，降低社区的模型复用性
 # Note: It is not recommended to re-train the tokenizer. MiniMind already includes one. This script is for learning and reference only. Training models with different tokenizers will lead to inconsistent outputs and reduce model reusability in the community.
 import os
@@ -43,6 +49,8 @@ def get_texts(data_path, max_lines=MAX_LINES):
         )
 
 def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPECIAL_TOKENS_NUM):
+    # BPE 学习的是“哪些字节片段经常一起出现并应合并”，不是语言模型参数。
+    # 词表一旦改变，embedding/lm_head 的词 id 语义也变了，已有模型权重不能直接复用。
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     

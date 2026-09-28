@@ -1,9 +1,15 @@
+"""LoRA 适配器的实现与管理：插入、加载、保存以及将增量合并回基础权重。
+
+适配器（adapter）是附加在预训练模型上的小型可训练模块。合并（merge）会把
+低秩增量直接加进线性层权重，便于导出成无需额外 LoRA 分支的普通模型。
+"""
 import torch
 from torch import optim, nn
 
 
 # 定义Lora网络结构
 class LoRA(nn.Module):
+    """可训练的低秩权重增量 ΔW = B×A；rank 控制增量子空间的维度。"""
     def __init__(self, in_features, out_features, rank):
         super().__init__()
         self.rank = rank  # LoRA的秩（rank），控制低秩矩阵的大小
@@ -19,6 +25,7 @@ class LoRA(nn.Module):
 
 
 def apply_lora(model, rank=16):
+    """在目标线性层上挂接 LoRA 分支，并冻结基础层参数。"""
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and module.in_features == module.out_features:
             lora = LoRA(module.in_features, module.out_features, rank=rank).to(model.device)
@@ -54,6 +61,7 @@ def save_lora(model, path):
 
 
 def merge_lora(model, lora_path, save_path):
+    """把已训练增量折叠进基础模型权重并保存合并结果。"""
     load_lora(model, lora_path)
     raw_model = getattr(model, '_orig_mod', model)
     state_dict = {k: v.cpu().half() for k, v in raw_model.state_dict().items() if '.lora.' not in k}

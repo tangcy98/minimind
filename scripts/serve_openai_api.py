@@ -1,3 +1,8 @@
+"""OpenAI 兼容 API 服务：通过 HTTP 接口暴露本地 MiniMind 的聊天生成能力。
+
+API（应用程序接口）定义客户端如何提交消息和接收结果；本文件把模型生成
+封装成兼容的请求/响应格式，并支持流式返回 token。
+"""
 import argparse
 import json
 import re

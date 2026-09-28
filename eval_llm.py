@@ -1,3 +1,8 @@
+"""命令行模型评估入口：加载本地权重和 tokenizer，交互式生成回答。
+
+它适合做训练阶段的快速人工检查；不是标准基准评测。若需可复现的分数，
+还要固定评测数据、解码参数和评分方式。
+"""
 import time
 import argparse
 import random
@@ -10,6 +15,8 @@ from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
 def init_model(args):
+    # 原生 checkpoint 是 state_dict（参数名到张量的映射）；Transformers 目录还带配置。
+    # tokenizer 和训练时必须一致，否则相同整数 id 会对应不同 token。
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
         model = MiniMindForCausalLM(MiniMindConfig(

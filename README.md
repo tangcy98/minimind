@@ -84,6 +84,8 @@
 
 #### 🎉 本项目包含以下内容
 
+> 想按训练数据流逐步读代码，可从 [MiniMind 训练代码阅读路线](./CODE_READING_GUIDE.md) 开始。
+
 - 提供完整的 MiniMind-LLM 结构代码（Dense + MoE），当前主线结构对齐 `Qwen3 / Qwen3-MoE` 生态。
 - 提供 Tokenizer 与分词器训练代码，支持 `<tool_call>`、`<tool_response>`、`<think>` 等模板标记。
 - 覆盖 Pretrain、SFT、LoRA、RLHF-DPO、RLAIF（PPO / GRPO / CISPO）、Tool Use、Agentic RL、自适应思考与模型蒸馏等完整训练流程。

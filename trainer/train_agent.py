@@ -1,3 +1,8 @@
+"""Agentic RL 训练入口：通过多轮工具交互优化助手的任务完成能力。
+
+Agent（智能体）会观察上下文、输出行动，再接收环境返回；此处环境包含工具。
+Tool observation（工具观察）是环境反馈，不是模型动作；策略训练只应统计模型生成 token。
+"""
 import os
 import sys
 
@@ -74,6 +79,7 @@ CHECK_ARGS = {
 
 # ======== 工具调用解析与执行 ========
 def parse_tool_calls(text):
+    """从模型输出的结构化标签中提取工具名和参数。"""
     calls = []
     for m in re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL):
         try: calls.append(json.loads(m.strip()))
@@ -81,6 +87,7 @@ def parse_tool_calls(text):
     return calls
 
 def execute_tool(name, args):
+    """将工具请求交给本文件的模拟实现；真实应用可替换成外部环境接口。"""
     fn = MOCK_RESULTS.get(name)
     if not fn: return None
     try:
@@ -90,6 +97,9 @@ def execute_tool(name, args):
 
 # ======== 多轮 Rollout ========
 def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda"):
+    # 一个样本可能走多轮：assistant 生成工具调用 → 执行工具 → 把 observation
+    # 接入上下文 → 继续生成。只有模型生成的 token 属于策略动作；
+    # 工具返回内容属于环境 observation，因此对应 response_mask 设为 0。
     all_outputs = []
     prompt_ids = None
     response_ids = []
@@ -118,6 +128,8 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
         new_text = rollout_result.completions[0]
         all_outputs.append(new_text)
         response_ids.extend(new_ids)
+        # 模型生成的回答 token 才是 policy action；Agent 这条路径将 EOS 边界标记排除在损失外。
+        # 工具返回 observation 会成为后续上下文，但不是模型动作，所以 mask=0、logp=0。
         response_mask.extend([int(t != tokenizer.eos_token_id) for t in new_ids])
         response_old_logps.extend(new_logps)
         final_context = context + new_text
@@ -136,6 +148,8 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
             result_str = (json.dumps(result, ensure_ascii=False) if result else '{"error": "tool not found"}')[:2048]  # 防止天文数字撑爆tokenizer
             messages.append({"role": "tool", "content": result_str})
 
+        # 通过临时 marker 找到 chat template 新增的 role/boundary 文本对应 token；
+        # observation 文本会拼进训练轨迹，但前面的 mask 规则让它不被当作策略动作。
         marker = f"<|agent_observation_{id(messages)}_{len(response_ids)}|>"
         assistant_message["content"] += marker
         marked_context = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=not unfinished, tools=tools, open_thinking=open_thinking)
@@ -157,6 +171,7 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
     return final_output, final_context, prompt_ids, response_ids, response_mask, response_old_logps, list(all_outputs), unfinished
 
 def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_gen, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda"):
+    """每个输入重复采样 num_gen 条轨迹，便于按 prompt 分组比较奖励。"""
     all_completions = []
     all_contexts = []
     all_prompt_ids = []
@@ -186,6 +201,8 @@ def validate_gt_in_text(text, gt_list):
     return {g for g in gt_list if ((s := str(g).strip()) and s.lower() in text.lower()) or (re.fullmatch(r'[-+]?\d+(?:\.\d+)?', str(g).strip().replace(',', '')) and any(abs(float(str(g).strip().replace(',', '')) - n) < 1e-6 for n in nums))}
 
 def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None):
+    # 这里把环境反馈变成序列级标量奖励：普通回答侧重格式/奖励模型，
+    # 工具轨迹侧重工具合法性、调用数量和 ground truth 命中情况。
     rewards = torch.zeros(len(completions), device=device)
     for idx, response in enumerate(completions):
         reward, answer = 0.0, response
@@ -199,7 +216,7 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
         tool_calls = []
         for turn_answer in turn_answers: tool_calls.extend(parse_tool_calls(turn_answer))  # 解析tool调用
         reward -= 0.5 * sum(abs(turn.count('<tool_call>') - turn.count('</tool_call>')) for turn in turn_answers)  # 标签扣分
-        # -------- 无工具调用：格式+reward奖励 --------
+        # -------- 无工具调用：格式 + 奖励模型分数 --------
         if not tool_calls:
             reward += 0.5 if 5 <= len(response.strip()) <= 800 else -0.5  # 长度分
             if '</think>' in response:
@@ -227,6 +244,8 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
                     except: raw = {}
                 check = CHECK_ARGS.get(name)
                 valid_call_count += int(bool(name in valid_names and check and check(raw)))
+            # ground truth（标准答案，GT）包含预期工具结果；验证调用数量/参数和最终文本，
+            # 将环境是否完成任务转成可自动检查的奖励。
             tool_gap = abs(valid_call_count - len(gt)) + max(0, len(tool_calls) - valid_call_count)  # tool数差值
             reward += 0.5 if tool_gap == 0 else -0.5 * tool_gap  # tool对齐分
             
@@ -245,12 +264,17 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         tools_batch = batch['tools']
         gt_batch = batch['gt']
 
+        # rollout 阶段不建计算图，避免把生成过程的显存图保留下来；
+        # 后续用缓存的 token/log-prob 重放轨迹，只对 policy forward 求梯度。
         with torch.no_grad():
             completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch = rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, args.num_generations, max_turns=3, max_new_tokens=args.max_gen_len, thinking_ratio=args.thinking_ratio, device=args.device)
 
         prompts = [tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True, tools=t) for m, t in zip(messages_batch, tools_batch)]
         packed_samples = []
         for p, r, m, old_lp in zip(prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch):
+            # 把多轮 prompt/回答/工具 observation 拼成单条 token 轨迹。
+            # p 的 mask 全 0：prompt 只做条件；m 标出哪些生成回答 token 作为策略动作。
+            # old_lp 与 next-token 预测位置对齐，开头 prompt 的首 token 没有前驱 logit。
             ids = p + r
             mask = [0] * len(p) + m
             old_logps = [0.0] * max(len(p) - 1, 0) + old_lp
@@ -274,6 +298,8 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             res = model(input_ids, attention_mask=full_mask)
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
             logits = res.logits[:, :-1, :]
+            # 先取每个位置实际下一个 token 的 log-prob，再用 response mask
+            # 排除 prompt、工具 observation、EOS 和 padding。
             per_token_logps = F.log_softmax(logits, dim=-1).gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
 
         with torch.no_grad():

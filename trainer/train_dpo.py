@@ -1,3 +1,9 @@
+"""DPO 偏好优化入口：直接用 chosen/rejected 样本对训练策略模型。
+
+DPO（Direct Preference Optimization，直接偏好优化）把偏好标签转成策略
+概率的相对目标；它不需要单独训练奖励模型，但会用冻结 reference（参考策略）
+约束新策略不要偏离初始行为太远。
+"""
 import os
 import sys
 
@@ -23,16 +29,26 @@ warnings.filterwarnings('ignore')
 
 
 def logits_to_log_probs(logits, labels):
+    """从每个位置的词表分布中取出目标 token 的 log probability。"""
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
+    # log_softmax 在词表维上归一化分数，并直接取对数以提高数值稳定性。
     log_probs = F.log_softmax(logits, dim=2)
+    # gather 按 labels 指定的 token id 从每个位置的 V 维分布中抽取一个值，
+    # 输出 [batch, seq]：每个位置“模型给实际目标 token 的对数概率”。
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return log_probs_per_token
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
+    # log probability（对数概率）把序列 token 概率的连乘换成求和。
+    # mask 只统计 assistant 回答，避免提示词长度影响偏好分数。
+    # preference pair（偏好对）是同一上下文的 chosen（较优）和 rejected（较差）回答。
+    # policy/reference 的 log-ratio 之差形成偏好 logit；beta 调节偏好目标的强度。
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
+    # 对回答中有效 token 的 log-prob 求和，得到序列 log 概率；
+    # padding 和上下文位置的 mask 为 0，因此不计入回答似然。
     ref_log_probs = (ref_log_probs * mask).sum(dim=1)
     policy_log_probs = (policy_log_probs * mask).sum(dim=1)
 
@@ -43,6 +59,9 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
+    # policy 的 chosen-vs-rejected 差值，减去 reference 的同一差值：
+    # 如果 policy 比 reference 更偏向 chosen，logits 为正，sigmoid(beta*logits) 增大，
+    # 负对数损失随之下降。这就是偏好信号如何转成梯度的关键。
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
     logits = pi_logratios - ref_logratios
@@ -51,6 +70,7 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
 
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
+    """reference 提供固定基线；policy 接收 DPO 损失并被优化。"""
     start_time = time.time()
 
     for step, batch in enumerate(loader, start=start_step + 1):
@@ -69,6 +89,8 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             param_group['lr'] = lr
 
         with autocast_ctx:
+            # reference 冻结且不求梯度；policy 才接收偏好损失的梯度。
+            # chosen/rejected 在 batch 维拼接，前半与后半顺序由 dpo_loss 对应拆开。
             with torch.no_grad():
                 ref_outputs = ref_model(x)
                 ref_logits = ref_outputs.logits

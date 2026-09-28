@@ -1,3 +1,4 @@
+"""Streamlit 聊天 Web UI：提供浏览器交互、流式回答、思考显示和工具调用体验。"""
 import random
 import re
 import json

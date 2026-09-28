@@ -1,4 +1,8 @@
-"""
+"""强化学习 rollout（轨迹采样）引擎，统一 PyTorch 与 SGLang 的生成接口。
+
+Rollout 是让当前策略实际生成一条或多条回答，并记录 token、mask 和生成时 log-prob；
+它把训练中的“采样/环境交互”与“用轨迹计算梯度”分开。替换生成后端不需要改策略损失。
+
 # 如果使用sglang加速，需通过以下命令首先启动（transformers格式）模型：
 python -m sglang.launch_server --model-path ./minimind-3 --attention-backend triton --host 0.0.0.0 --port 8998
 """
@@ -22,6 +26,8 @@ from transformers import AutoTokenizer
 
 # ===== 计算每个 token 的 logprob =====
 def compute_per_token_logps(model, input_ids: Tensor, n_keep: int, attention_mask: Optional[Tensor] = None) -> Tensor:
+    # policy（策略）是产生回答的模型。log π(a_t|s_t) 表示在状态 s_t 下
+    # 生成 token 动作 a_t 的对数概率；新旧概率之比衡量策略改变幅度。
     if n_keep <= 0:
         return input_ids.new_empty((input_ids.size(0), 0), dtype=torch.float32)
     unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
@@ -39,6 +45,7 @@ def compute_per_token_logps(model, input_ids: Tensor, n_keep: int, attention_mas
 # ===== Rollout 结果 =====
 @dataclass
 class RolloutResult:
+    """一批轨迹的标准结果：全序列、回答片段、采样概率、文本和有效长度信息。"""
     output_ids: Tensor
     completion_ids: Tensor
     per_token_logps: Tensor
@@ -49,6 +56,7 @@ class RolloutResult:
 
 # ===== Rollout 引擎抽象基类 =====
 class RolloutEngine(ABC):
+    """抽象采样后端；不同引擎必须返回兼容的 RolloutResult。"""
     tokenizer = None
     
     @abstractmethod
@@ -69,6 +77,8 @@ class TorchRolloutEngine(RolloutEngine):
         self.autocast_ctx = autocast_ctx
     
     def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
+        # completion 是模型针对 prompt 新生成的回答。重复生成形成 GRPO 的组；
+        # 同时缓存行为策略（采样当时的 policy）的 log-prob，之后计算 importance ratio。
         model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
         ctx = self.autocast_ctx if self.autocast_ctx else nullcontext()
         with torch.no_grad(), ctx:
@@ -173,6 +183,8 @@ class SGLangRolloutEngine(RolloutEngine):
         )
     
     def update_policy(self, model: torch.nn.Module):
+        # 外部推理服务持有独立权重副本；训练侧把最新 policy 写到共享目录，
+        # 再通知 SGLang reload，保证下一轮 rollout 使用更新后的策略。
         ok = True
         if not dist.is_initialized() or dist.get_rank() == 0:
             try:

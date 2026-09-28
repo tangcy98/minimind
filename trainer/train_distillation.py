@@ -1,3 +1,8 @@
+"""知识蒸馏训练入口：学生模型同时学习真实标签与教师输出分布。
+
+Teacher（教师）是提供目标分布的强模型，student（学生）是被优化的小模型；
+教师只做前向推理，不参与梯度更新。
+"""
 import os
 import sys
 
@@ -23,11 +28,16 @@ warnings.filterwarnings('ignore')
 
 
 def distillation_loss(student_logits, teacher_logits, temperature=1.0, reduction='batchmean'):
+    # 蒸馏让学生拟合教师的“软分布”，而非只看正确 token 的硬标签。
+    # 温度越高分布越平滑；乘 T² 用于抵消温度对梯度尺度的影响。
     with torch.no_grad():
+        # soft target（软目标）是教师对整个词表的概率分布，而不只是正确 token。
+        # detach 截断梯度，确保教师只提供固定监督信号。
         teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
 
     student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
 
+    # KL 散度衡量两个概率分布的差异；训练目标让学生分布靠近教师分布。
     kl = F.kl_div(
         student_log_probs,
         teacher_probs,
@@ -64,6 +74,9 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
                 teacher_logits = teacher_logits[..., :vocab_size_student]
 
         # ========== 计算损失 ==========
+        # CE（交叉熵）提供数据集上的硬目标，即只告诉模型正确 token；
+        # KL 蒸馏提供教师的全词表分布目标。alpha 在两类目标间分配权重，
+        # mask 保证只在应训练的 token 上比较。
         # 1) Ground-Truth CE Loss
         shift_labels = labels[..., 1:].contiguous()
         loss_mask_flat = loss_mask.view(-1)

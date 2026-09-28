@@ -1,3 +1,9 @@
+"""训练数据适配层：读取 JSON/JSONL，把文本或对话样本变成模型输入与监督标签。
+
+阅读顺序建议：PretrainDataset → SFTDataset → DPODataset → RLAIFDataset /
+AgentRLDataset。Dataset 是 PyTorch 的样本接口；DataLoader 会再把多个样本
+组成 batch。这里定义的标签和 mask 决定哪些 token 的预测误差会进入训练目标。
+"""
 from torch.utils.data import Dataset
 import torch
 import json
@@ -7,6 +13,7 @@ from datasets import load_dataset, Features, Sequence, Value
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def pre_processing_chat(conversations, add_system_ratio=0.2):
+    """轻量随机化对话上下文；系统提示是约束助手行为的开场消息。"""
     # tool use 数据完整保留不做处理
     if any(conv.get('tools') for conv in conversations): return conversations
 
@@ -29,6 +36,7 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
     return conversations
 
 def post_processing_chat(prompt_content, empty_think_ratio=0.2, remove_empty_think=None):
+    """按概率处理空的 think 区段，降低模型对固定空思考模板的过拟合。"""
     # 以80%概率移除空思考标签
     if '<think>\n\n</think>\n\n' in prompt_content:
         if remove_empty_think is None:
@@ -38,6 +46,7 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.2, remove_empty_thi
     return prompt_content
 
 class PretrainDataset(Dataset):
+    """自回归预训练数据：让模型根据左侧上下文预测文本中的下一个 token。"""
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
@@ -48,6 +57,8 @@ class PretrainDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
+        # 预训练样本是独立文本：加 BOS/EOS 后补齐到固定长度。
+        # pad 标签设为 -100，使交叉熵忽略补齐位置。
         sample = self.samples[index]
         tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
@@ -59,6 +70,11 @@ class PretrainDataset(Dataset):
 
 
 class SFTDataset(Dataset):
+    """把监督微调（SFT）对话格式化为模型输入，并仅监督 assistant 轮次。
+
+    SFT 是 Supervised Fine-Tuning 的缩写，意思是用人工/合成的示范回答继续
+    训练预训练模型。它仍然使用 next-token 预测，变化主要在对话模板和损失 mask。
+    """
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer
@@ -72,6 +88,8 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
+        # chat_template 把 role、轮次边界、工具定义/调用序列化为模型实际看到的文本。
+        # 这意味着模板本身也是模型接口的一部分，训练与推理必须保持一致。
         messages = []
         tools = None
         for message in conversations:
@@ -89,6 +107,10 @@ class SFTDataset(Dataset):
         )
 
     def generate_labels(self, input_ids):
+        # 默认全部置为 ignore_index，只在 assistant 内容及结束标记上开启损失。
+        # 因而 user/system/tool 提供上下文，但不会被要求由模型“复述”。
+        # 注意模型 forward 随后会整体右移 labels：此处标签保留原始 token 位置，
+        # 与位置 t 的输入配对后，实际监督的是位置 t+1 的 token。
         labels = [-100] * len(input_ids)
         i = 0
         while i < len(input_ids):
@@ -123,6 +145,7 @@ class SFTDataset(Dataset):
 
 
 class DPODataset(Dataset):
+    """偏好数据适配器：把同一上下文下更好/较差的两条回答编码成配对样本。"""
     def __init__(self, file_path, tokenizer, max_length=4096):
         super().__init__()
         self.tokenizer = tokenizer
@@ -136,6 +159,8 @@ class DPODataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
+        # 每条偏好样本有 chosen/rejected 两段完整对话。
+        # 两边采用同一模板、长度上限和 assistant loss mask，便于公平比较概率。
         sample = self.samples[index]
         chosen = sample['chosen']  # 是一个 list，里面包含若干 {role, content}
         rejected = sample['rejected']  # 同上
@@ -161,6 +186,8 @@ class DPODataset(Dataset):
 
         rejected_input_ids = rejected_encoding['input_ids']
         rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
+        # x 是预测输入，y 是向左错一位的目标；mask 同步右移，保证位置 t 的
+        # 模型输出只为位置 t+1 的 assistant token 计分。
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
@@ -197,6 +224,7 @@ class DPODataset(Dataset):
 
 
 class RLAIFDataset(Dataset):
+    """在线语言模型强化学习输入：格式化 prompt，由训练循环负责生成和评分。"""
     def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.5):
         super().__init__()
         self.tokenizer = tokenizer
@@ -219,6 +247,8 @@ class RLAIFDataset(Dataset):
             add_generation_prompt=True
         )
     def __getitem__(self, index):
+        # RL 阶段此处只给出 prompt；回答由 rollout 引擎在线采样，
+        # 奖励不是静态标签，而是在每轮训练中对新生成结果重新计算。
         sample = self.samples[index]
         prompt = self.create_chat_prompt(sample['conversations'])
 
@@ -228,6 +258,7 @@ class RLAIFDataset(Dataset):
         }
 
 class AgentRLDataset(Dataset):
+    """Agentic RL 的静态输入：历史消息、可用工具定义和 ground truth。"""
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer
@@ -241,6 +272,8 @@ class AgentRLDataset(Dataset):
         return len(self.samples)
 
     def parse_conversations(self, conversations):
+        # 数据把最后一个 assistant 位置留空作为待续写槽位；去掉它后，
+        # rollout 会根据前面的历史生成回答。ground truth 单独用于奖励验证。
         messages = []
         tools = None
         for message in conversations:

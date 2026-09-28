@@ -1,3 +1,8 @@
+"""全参数 SFT 训练入口：从预训练权重出发，用对话示范继续训练全部参数。
+
+Supervised Fine-Tuning（监督微调）不是新的网络结构；它通过对话模板与
+assistant-only 标签 mask 改变监督内容，让模型学习遵循指令和组织回答。
+"""
 import os
 import sys
 
@@ -22,6 +27,7 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    """SFT 的参数更新循环；训练机制与预训练相同，差别主要来自 SFT 标签。"""
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
@@ -31,7 +37,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             param_group['lr'] = lr
 
         with autocast_ctx:
+            # 与预训练共享同一种 next-token 交叉熵；区别在数据集的 labels：
+            # SFTDataset 将非 assistant token 设为 -100，因此 loss 只教模型生成助手回复。
             res = model(input_ids, labels=labels)
+            # res.loss 是 token 预测交叉熵；MoE 模型还会产生负载均衡 aux_loss，
+            # 加在一起后语言预测与路由器都能收到训练信号。
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
@@ -99,6 +109,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
+    # SFT 从预训练 checkpoint 初始化。若想追踪“聊天能力”如何形成，
+    # 对照阅读 SFTDataset.generate_labels 与本文件的 train_epoch。
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
