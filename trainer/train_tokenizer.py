@@ -1,8 +1,16 @@
-"""Tokenizer 训练示例：从语料学习 BPE 子词词表并导出 tokenizer 文件。
+"""【阅读路线 第 1 站】Tokenizer 训练示例：从语料学习 BPE 子词词表并导出 tokenizer 文件。
 
-Tokenizer（分词器）将字符串切为 token（模型使用的离散符号），再映射成整数 id。
-BPE（Byte Pair Encoding，字节对编码）反复合并语料中高频相邻片段。
-MiniMind 已提供兼容词表；更换词表会破坏 token id 与 embedding 行的对应关系。
+这一站要建立的概念：模型从头到尾只处理整数 id，“文字 ↔ id”的双向转换全部由 tokenizer 完成。
+- Tokenizer（分词器）：把字符串切成 token（模型使用的离散符号），再映射成整数 id；解码时反过来。
+- 词表（vocabulary）：token ↔ id 的固定映射，大小 V 直接决定模型 embedding/lm_head 的形状。
+- BPE（Byte Pair Encoding，字节对编码）：从最小单元（这里是 256 个字节）出发，统计语料中
+  出现次数最多的相邻片段对，把它合并成一个新 token；重复直到词表达到 vocab_size。
+  常见词会被合成一个 token，罕见词则拆成若干子词/字节，因此任何字符串都能被编码，没有“未登录词”。
+- 词表大小的权衡：V 越大，同一段文字切出的 token 越少（序列更短、推理更快），
+  但 embedding/lm_head 参数越多、每个 token 的训练样本越稀疏。MiniMind 取 6400，是为极小模型做的折中。
+
+MiniMind 已提供训练好的词表（model/tokenizer.json）；更换词表会破坏 token id 与 embedding 行的
+对应关系，已有权重全部失效。本脚本仅用于理解 tokenizer 是如何得到的。
 """
 # 注：不建议再重复训练tokenizer（“词典”），MiniMind已自带，此脚本仅供学习和参考。基于不同词典训练的模型将导致输出完全不统一，降低社区的模型复用性
 # Note: It is not recommended to re-train the tokenizer. MiniMind already includes one. This script is for learning and reference only. Training models with different tokenizers will lead to inconsistent outputs and reduce model reusability in the community.
@@ -49,11 +57,19 @@ def get_texts(data_path, max_lines=MAX_LINES):
         )
 
 def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPECIAL_TOKENS_NUM):
-    # BPE 学习的是“哪些字节片段经常一起出现并应合并”，不是语言模型参数。
+    # BPE 学习的是“哪些字节片段经常一起出现并应合并”（一张合并规则表 merges + 词表 vocab），
+    # 不是神经网络参数，也不需要 GPU。
     # 词表一旦改变，embedding/lm_head 的词 id 语义也变了，已有模型权重不能直接复用。
     tokenizer = Tokenizer(models.BPE())
+    # ByteLevel 预分词：先把文本按 UTF-8 编码成字节，再把每个字节映射成一个可见字符（GPT-2 的做法），
+    # 并按空格/标点做初步切分，BPE 只在切分出的片段内部合并。
+    # 好处是基础字母表只有 256 个字节，任何语言、emoji 都能表示；一个汉字通常占 3 个字节，
+    # 常见汉字会在训练中被合并成单个 token，罕见汉字则可能保持为多个字节 token。
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    
+
+    # 特殊 token：不参与 BPE 合并、永远作为整体出现的控制符号。它们按列表顺序占据最前面的 id，
+    # 所以 <|endoftext|>=0、<|im_start|>=1、<|im_end|>=2，与 MiniMindConfig 的 bos/eos 默认值对应。
+    # 列表里多模态/TTS 相关的 token 本仓库暂未使用，是为了与 Qwen 系列词表布局兼容而预留。
     special_tokens_list = [
         "<|endoftext|>", "<|im_start|>", "<|im_end|>", 
         "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>", 
@@ -66,9 +82,14 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         "<tool_response>", "</tool_response>",
         "<think>", "</think>"
     ]
+    # additional_tokens 是工具调用/思考的结构标记，同样整体保留，但在配置中标为 special=False，
+    # 这样 decode(skip_special_tokens=True) 时它们不会被删掉，下游才能解析 <tool_call>、<think>。
+    # buffer token 是空占位：将来要新增控制符号时可以直接“改名”复用，而不必改变词表大小和已有 id。
     num_buffer = special_tokens_num - len(special_tokens_list + additional_tokens_list)
     buffer_tokens = [f"<|buffer{i}|>" for i in range(1, num_buffer + 1)] # 预留一定数量的token位置
     all_special_tokens = special_tokens_list + additional_tokens_list + buffer_tokens
+    # initial_alphabet 保证 256 个字节全部在词表中（即使语料里没出现过），从而任何输入都可编码。
+    # 实际能学到的合并次数 ≈ vocab_size - 256 - 特殊 token 数。
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
         show_progress=True,
@@ -76,7 +97,10 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         special_tokens=all_special_tokens
     )
     texts = get_texts(data_path)
+    # train_from_iterator 内部：统计所有片段内相邻 token 对的频次 → 合并最高频的一对 → 更新频次 → 循环，
+    # 直到词表大小达到 vocab_size。结果是有序的 merges 列表，编码新文本时按同样顺序依次应用合并。
     tokenizer.train_from_iterator(texts, trainer=trainer)
+    # ByteLevel 解码器：把“字节映射字符”还原成原始字节，再按 UTF-8 解码成字符串。
     tokenizer.decoder = decoders.ByteLevel()
     tokenizer.add_special_tokens(special_tokens_list)
 
@@ -104,6 +128,10 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
             "special": True if token in special_tokens_list else False
         }
 
+    # tokenizer_config.json：供 transformers 的 AutoTokenizer 读取的“使用说明”。
+    # 其中 bos/eos/pad 的指定、以及 chat_template（Jinja2 对话模板）都会直接影响训练数据的构造，
+    # 第 3 站的 SFTDataset 与推理脚本都依赖这份模板。add_bos_token=False 表示 tokenize 时不自动加 BOS，
+    # 由数据集代码或模板显式控制。
     config = {
         "add_bos_token": False,
         "add_eos_token": False,
@@ -135,6 +163,11 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
     print("Tokenizer training completed.")
 
 def eval_tokenizer(tokenizer_dir):
+    # 三项检查：
+    # 1) 模板渲染 + 编码/解码往返一致性（decode(encode(x)) == x），这是 tokenizer 最基本的正确性要求；
+    # 2) 压缩率 = 字符数 / token 数，越高说明同样文本切出的 token 越少，模型单位上下文能装下更多内容；
+    # 3) 流式解码：一个汉字的 3 个 UTF-8 字节可能被拆进不同 token，只解码到一半时会得到替换符 '�'，
+    #    因此流式输出要先缓冲 token，直到能解出完整字符再打印（TextStreamer 等工具内部也是这么做的）。
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     messages = [

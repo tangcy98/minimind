@@ -1,7 +1,15 @@
-"""全参数 SFT 训练入口：从预训练权重出发，用对话示范继续训练全部参数。
+"""【阅读路线 第 5 站（上）】全参数 SFT 训练入口：从预训练权重出发，用对话示范继续训练全部参数。
 
-Supervised Fine-Tuning（监督微调）不是新的网络结构；它通过对话模板与
-assistant-only 标签 mask 改变监督内容，让模型学习遵循指令和组织回答。
+建议对照 train_pretrain.py 阅读：两者的 train_epoch 与 __main__ 几乎逐行相同。
+这正说明了一个重要事实——SFT（Supervised Fine-Tuning，监督微调）不是新的网络结构，
+也不是新的 loss 公式，它仍然是 next-token 交叉熵。能力的变化完全来自数据：
+1. 数据变成了 chat template 渲染后的多轮对话（SFTDataset.create_chat_prompt）；
+2. labels 只在 assistant 回复上开启（SFTDataset.generate_labels），模型只学“怎么回答”；
+3. 从预训练权重出发（from_weight='pretrain'），学习率小一个数量级（默认 1e-5 vs 预训练 5e-4），
+   在保留预训练知识的前提下，把模型的输出行为“对齐”到对话格式上。
+
+预训练模型只会“续写”；经过 SFT，模型学会了：看到 <|im_start|>assistant 就以助手身份作答、
+答完输出 <|im_end|> 停止、在需要时生成 <think> / <tool_call> 结构。
 """
 import os
 import sys
@@ -27,7 +35,8 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    """SFT 的参数更新循环；训练机制与预训练相同，差别主要来自 SFT 标签。"""
+    """SFT 的参数更新循环；训练机制与预训练完全相同（逐步注释见 train_pretrain.train_epoch），
+    差别只来自 SFT 标签。"""
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
@@ -39,12 +48,15 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         with autocast_ctx:
             # 与预训练共享同一种 next-token 交叉熵；区别在数据集的 labels：
             # SFTDataset 将非 assistant token 设为 -100，因此 loss 只教模型生成助手回复。
+            # 由于 cross_entropy 只在有效 token 上求平均，res.loss 是“batch 内所有 assistant token 的平均 NLL”：
+            # 回答越长的样本贡献的 token 越多，在 loss 中的权重也越大。
             res = model(input_ids, labels=labels)
             # res.loss 是 token 预测交叉熵；MoE 模型还会产生负载均衡 aux_loss，
             # 加在一起后语言预测与路由器都能收到训练信号。
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
+        # 以下“缩放反传 → 累积 → 还原缩放 → 裁剪 → 更新 → 清零”与预训练完全相同。
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0 or step == iters:

@@ -1,7 +1,24 @@
-"""Agentic RL 训练入口：通过多轮工具交互优化助手的任务完成能力。
+"""【阅读路线 第 7 站（三）】Agentic RL 训练入口：通过多轮工具交互优化助手的任务完成能力。
+
+建议在读完 train_grpo.py 之后阅读：本文件的损失函数（组内优势 + GRPO/CISPO + KL）与 GRPO 完全相同，
+新东西集中在“轨迹是怎么采出来的”和“奖励是怎么算的”：
+
+- 单轮 RL：prompt → 模型一次性生成回答 → 打分。
+- Agentic RL：prompt → 模型生成（可能包含 <tool_call>）→ 程序解析并执行工具 → 把工具结果作为新消息接回上下文
+  → 模型继续生成 → …… 直到模型不再调用工具或达到最大轮数 → 按“任务是否完成”打分。
 
 Agent（智能体）会观察上下文、输出行动，再接收环境返回；此处环境包含工具。
-Tool observation（工具观察）是环境反馈，不是模型动作；策略训练只应统计模型生成 token。
+一条轨迹因此是“模型 token”和“环境 token”交替拼接的序列：
+
+    [prompt] [模型: 思考 + <tool_call>…</tool_call>] [环境: <tool_response>…</tool_response>] [模型: 最终回答]
+     mask=0            mask=1                                 mask=0                          mask=1
+
+Tool observation（工具观察）是环境反馈，不是模型动作：它们会进入上下文影响后续生成，
+但不能计入策略损失（模型并没有“选择”这些 token，对它们求 log-prob 梯度没有意义）。
+这就是 response_mask 的作用。
+
+阅读顺序：工具定义与模拟执行 → rollout_single（单条多轮轨迹）→ rollout_batch
+→ calculate_rewards（规则化奖励）→ rl_train_epoch（打包轨迹、计算损失）。
 """
 import os
 import sys
@@ -41,6 +58,8 @@ def rep_penalty(text, n=3, cap=0.5):
     return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
 
 # ======== 工具定义 ========
+# OpenAI function calling 格式的工具 schema：名字、描述、参数的 JSON Schema。
+# 它们会被 chat template 写进 system 消息，模型据此决定调用哪个工具、传什么参数。
 TOOLS = [
     {"type": "function", "function": {"name": "calculate_math", "description": "计算数学表达式", "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}}},
     {"type": "function", "function": {"name": "unit_converter", "description": "单位换算", "parameters": {"type": "object", "properties": {"value": {"type": "number"}, "from_unit": {"type": "string"}, "to_unit": {"type": "string"}}, "required": ["value", "from_unit", "to_unit"]}}},
@@ -58,6 +77,8 @@ TRANSLATE_DATA = {("你好世界", "english"): "Hello World", ("Good morning", "
 UNIT_DATA = {"km_miles": 0.621371, "miles_km": 1.60934, "kg_pounds": 2.20462, "pounds_kg": 0.453592, "meters_feet": 3.28084, "feet_meters": 0.3048, "celsius_fahrenheit": 1.8, "fahrenheit_celsius": 0.5556}
 
 # ======== 模拟执行 ========
+# 用确定性的假数据模拟工具返回：RL 训练需要海量、快速、可复现的环境交互，
+# 真实 API 调用太慢且结果会变化，会让奖励不稳定。
 MOCK_RESULTS = {
     "calculate_math": lambda args: {"result": str(safe_math_eval(args.get("expression", "0")))},
     "unit_converter": lambda args: {"result": round(float(args.get("value", 0)) * UNIT_DATA.get(f"{args.get('from_unit', '').lower()}_{args.get('to_unit', '').lower()}", 1), 4)},
@@ -100,6 +121,19 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
     # 一个样本可能走多轮：assistant 生成工具调用 → 执行工具 → 把 observation
     # 接入上下文 → 继续生成。只有模型生成的 token 属于策略动作；
     # 工具返回内容属于环境 observation，因此对应 response_mask 设为 0。
+    #
+    # 关键设计：在 token 层面“追加”而不是每轮“重新 tokenize 整段文本”。
+    # 同一段文字重新 tokenize 可能得到与模型实际采样不同的切分（BPE 切分依赖上下文边界），
+    # 那样训练时计算 log-prob 的 token 序列就不是模型真正生成的那一串，old log-prob 也对不上。
+    # 因此这里始终维护 prompt_ids + response_ids 这条精确的 token 序列：
+    # 模型生成的 id 原样追加；环境返回的部分单独 tokenize 后追加。
+    #
+    # 返回值（每条轨迹）：
+    #   prompt_ids        初始 prompt 的 token（只在第一轮 tokenize 一次）
+    #   response_ids      之后所有 token（模型生成 + 环境 observation 交替拼接）
+    #   response_mask     与 response_ids 等长，1=模型生成的策略动作，0=环境 token（及 EOS）
+    #   response_old_logps 与 response_ids 等长，模型 token 为采样时的 log-prob，环境 token 填 0
+    #   unfinished        达到 max_turns 时模型仍在调用工具（任务未完成）
     all_outputs = []
     prompt_ids = None
     response_ids = []
@@ -112,6 +146,7 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
         context = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools, open_thinking=open_thinking)
         if prompt_ids is None:
             prompt_ids = tokenizer(context, add_special_tokens=False)["input_ids"]
+        # 每轮都以“到目前为止的完整 token 序列”为前缀继续生成（第 2 轮起包含上一轮的调用与工具结果）。
         input_ids = torch.tensor([prompt_ids + response_ids], device=device)
         rollout_result = rollout_engine.rollout(
             prompt_ids=input_ids,
@@ -128,14 +163,17 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
         new_text = rollout_result.completions[0]
         all_outputs.append(new_text)
         response_ids.extend(new_ids)
-        # 模型生成的回答 token 才是 policy action；Agent 这条路径将 EOS 边界标记排除在损失外。
-        # 工具返回 observation 会成为后续上下文，但不是模型动作，所以 mask=0、logp=0。
+        # 模型生成的回答 token 才是 policy action；Agent 这条路径将 EOS 边界标记排除在损失外
+        # （与 GRPO/PPO 不同，那里 EOS 计入损失）。
+        # 工具返回 observation 会成为后续上下文，但不是模型动作，所以 mask=0、logp=0（见本轮末尾）。
         response_mask.extend([int(t != tokenizer.eos_token_id) for t in new_ids])
         response_old_logps.extend(new_logps)
         final_context = context + new_text
+        # 这一轮没有工具调用 → 视为给出了最终回答，轨迹结束。
         calls = parse_tool_calls(new_text)
         if not calls:
             break
+        # 执行本轮所有工具调用，把 assistant 输出与每个工具结果（role=tool）追加到结构化 messages 中。
         unfinished = turn == max_turns - 1
         assistant_message = {"role": "assistant", "content": new_text}
         messages.append(assistant_message)
@@ -148,7 +186,11 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
             result_str = (json.dumps(result, ensure_ascii=False) if result else '{"error": "tool not found"}')[:2048]  # 防止天文数字撑爆tokenizer
             messages.append({"role": "tool", "content": result_str})
 
-        # 通过临时 marker 找到 chat template 新增的 role/boundary 文本对应 token；
+        # 难点：怎样只拿到“模型输出之后、下一轮生成之前”模板新增的那段文本（环境 token）？
+        # 它包括：assistant 消息的结束符 <|im_end|>\n、<|im_start|>user\n<tool_response>…</tool_response><|im_end|>\n、
+        # 以及下一轮的 <|im_start|>assistant\n<think>… 生成前缀。
+        # 做法：在 assistant 内容末尾临时插入一个唯一 marker，渲染整段模板后用 partition 切出 marker 之后的部分，
+        # 就是精确的增量文本 observation；随后把 assistant 内容还原。只 tokenize 这段增量，前面的 token 保持不变。
         # observation 文本会拼进训练轨迹，但前面的 mask 规则让它不被当作策略动作。
         marker = f"<|agent_observation_{id(messages)}_{len(response_ids)}|>"
         assistant_message["content"] += marker
@@ -158,8 +200,10 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
         if not found:
             raise RuntimeError("chat template did not preserve the assistant content boundary")
         obs_delta = tokenizer(observation, add_special_tokens=False)["input_ids"]
+        # 模型自己生成的最后一个 token 通常已是 <|im_end|>，而模板增量也以 <|im_end|> 开头，去掉重复的这一个。
         if new_ids and new_ids[-1] == tokenizer.eos_token_id and obs_delta[:1] == [tokenizer.eos_token_id]:
             obs_delta = obs_delta[1:]
+        # observe_context 只是当前完整上下文的文本形式，用于调试打印与返回，不参与 token 序列构造。
         observe_context = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=not unfinished, tools=tools, open_thinking=open_thinking)
         response_ids.extend(obs_delta)
         response_mask.extend([0] * len(obs_delta))
@@ -203,6 +247,11 @@ def validate_gt_in_text(text, gt_list):
 def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None):
     # 这里把环境反馈变成序列级标量奖励：普通回答侧重格式/奖励模型，
     # 工具轨迹侧重工具合法性、调用数量和 ground truth 命中情况。
+    # 这是“可验证奖励”（verifiable reward）的思路：对能自动判断对错的任务（计算结果、查询数值），
+    # 用程序规则打分比奖励模型更可靠，也更难被模型“钻空子”。
+    # 各分项大致为：标签闭合扣分；无工具时——长度分 + 思考格式分 + RM 分 − 重复惩罚；
+    # 有工具时——工具调用数量/参数与 gt 是否对齐 + 最终回答中 gt 命中比例（最多 +2.5）− 未完成扣分 − 重复惩罚。
+    # 最终都裁剪到 [-3, 3]。
     rewards = torch.zeros(len(completions), device=device)
     for idx, response in enumerate(completions):
         reward, answer = 0.0, response
@@ -264,8 +313,10 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         tools_batch = batch['tools']
         gt_batch = batch['gt']
 
+        # ===== 采样阶段 =====
         # rollout 阶段不建计算图，避免把生成过程的显存图保留下来；
         # 后续用缓存的 token/log-prob 重放轨迹，只对 policy forward 求梯度。
+        # 每个样本采样 num_generations 条多轮轨迹，形成 GRPO 的组。
         with torch.no_grad():
             completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch = rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, args.num_generations, max_turns=3, max_new_tokens=args.max_gen_len, thinking_ratio=args.thinking_ratio, device=args.device)
 
@@ -275,15 +326,21 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             # 把多轮 prompt/回答/工具 observation 拼成单条 token 轨迹。
             # p 的 mask 全 0：prompt 只做条件；m 标出哪些生成回答 token 作为策略动作。
             # old_lp 与 next-token 预测位置对齐，开头 prompt 的首 token 没有前驱 logit。
+            # 对齐规则：old_logps 与“预测位置”对齐（logits[:, :-1] 的第 k 列预测 ids[k+1]），长度为 len(ids)−1；
+            # response 第 k 个 token 位于 ids 的 len(p)+k，由第 len(p)−1+k 列预测，
+            # 所以在 old_lp 前面补 len(p)−1 个 0。mask 与 ids 同位置，稍后切 [:, 1:] 与预测位置对齐。
             ids = p + r
             mask = [0] * len(p) + m
             old_logps = [0.0] * max(len(p) - 1, 0) + old_lp
+            # 超长时从左侧截断（保留最近的上下文与全部回答），三个序列同步截断以保持对齐。
             if len(ids) > args.max_total_len:
                 ids = ids[-args.max_total_len:]
                 mask = mask[-args.max_total_len:]
                 old_logps = old_logps[-(len(ids) - 1):]
             prompt_len = next((i for i, v in enumerate(mask) if v == 1), len(mask))
             packed_samples.append((ids, mask, prompt_len, old_logps))
+        # 各轨迹长度不同，右侧补齐成矩形张量：input_ids / full_response_masks 为 [N, L]，old_per_token_logps 为 [N, L-1]；
+        # full_mask 是注意力用的 padding mask（真实 token=1），与策略损失用的 response mask 是两回事。
         seq_lens = torch.tensor([len(ids) for ids, _, _, _ in packed_samples], device=args.device)
         max_len = seq_lens.max().item()
         input_ids = torch.tensor([ids + [tokenizer.pad_token_id] * (max_len - len(ids)) for ids, _, _, _ in packed_samples], device=args.device)
@@ -294,6 +351,9 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
 
         rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch)
 
+        # ===== 学习阶段 =====
+        # 与 GRPO 不同，这里对“整条序列的所有预测位置”都算 log-prob（[N, L-1]），
+        # 因为模型 token 与环境 token 交错分布，没有一个连续的“回答区间”可切，统一靠 mask 选出策略动作。
         with autocast_ctx:
             res = model(input_ids, attention_mask=full_mask)
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
@@ -305,6 +365,8 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         with torch.no_grad():
             ref_per_token_logps = compute_per_token_logps(ref_model, input_ids, input_ids.size(1) - 1, attention_mask=full_mask)
 
+        # completion_mask：response mask 去掉第一列，与预测位置对齐（第 k 列 = 目标 ids[k+1] 是否为策略动作）。
+        # 下面的 EOS 截断沿用 GRPO 的写法；由于 rollout_single 已把 EOS 的 mask 置 0，这里通常不会再截掉什么。
         completion_mask = full_response_masks[:, 1:]
         is_eos = (input_ids[:, 1:] == tokenizer.eos_token_id) & completion_mask.bool()
         eos_idx = torch.full((completion_mask.size(0),), completion_mask.size(1) - 1, device=args.device, dtype=torch.long)
@@ -334,6 +396,8 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
                     Logger(f"[DEBUG] gen[{i}][{j}] reward={rewards[idx].item():.4f}")
                     Logger('='*100)
 
+        # 以下（组内优势、KL、ratio、GRPO/CISPO 损失）与 train_grpo.py 完全相同，详细解释见该文件。
+        # 唯一区别：mask 只覆盖模型生成的 token，环境 observation 不产生策略梯度。
         grouped_rewards = rewards.view(-1, args.num_generations)
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)
         std_r = grouped_rewards.std(dim=1, unbiased=False).repeat_interleave(args.num_generations)
@@ -350,6 +414,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             per_token_loss1 = ratio * advantages.unsqueeze(1)
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
             per_token_loss = -(torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl)
+        # 若整批都没有有效策略 token，用 “×0” 的损失保持计算图完整，DDP 反向通信照常进行。
         policy_loss = (((per_token_loss * completion_mask).sum(dim=1)[valid_rows] / token_counts[valid_rows].clamp(min=1)).mean()
                        if valid_rows.any() else per_token_loss.sum() * 0.0)
         loss = (policy_loss + aux_loss) / args.accumulation_steps

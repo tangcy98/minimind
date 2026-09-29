@@ -1,4 +1,9 @@
-"""命令行模型评估入口：加载本地权重和 tokenizer，交互式生成回答。
+"""【阅读路线 第 8 站】命令行模型评估入口：加载本地权重和 tokenizer，交互式生成回答。
+
+这是把前面各站串起来的“闭环”：tokenizer（第 1 站）+ chat template（第 3 站）
++ 某个训练阶段产出的权重（第 4~7 站）+ generate 解码（第 2 站末尾的 MiniMindForCausalLM.generate）。
+建议每训练完一个阶段就用它对比一下：pretrain 权重只会续写文本，full_sft 之后才会按对话格式作答，
+RL 之后回答风格/格式会进一步变化。
 
 它适合做训练阶段的快速人工检查；不是标准基准评测。若需可复现的分数，
 还要固定评测数据、解码参数和评分方式。
@@ -27,13 +32,17 @@ def init_model(args):
         ))
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
+        # 推理加载用 strict=True：键名或形状任何不匹配都立即报错，避免“悄悄用了随机权重”。
+        # （对比训练侧 init_model 的 strict=False。）
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
         if args.lora_weight != 'None':
+            # LoRA 推理 = 基础权重 + 挂上 LoRA 分支 + 加载 adapter 参数；也可先用 merge_lora 合并成单一权重。
             apply_lora(model)
             load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
+    # 推理用 fp16 权重（显存减半）；eval() 关闭 dropout 并让 MoE 不再计算 aux_loss。
     return model.half().eval().to(args.device), tokenizer
 
 def main():
@@ -77,6 +86,10 @@ def main():
         if input_mode == 0: print(f'💬: {prompt}')
         conversation = conversation[-args.historys:] if args.historys else []
         conversation.append({"role": "user", "content": prompt})
+        # 输入格式必须与训练时一致：
+        # - 预训练模型只见过 “BOS + 纯文本”，所以直接拼 BOS 让它续写；
+        # - 对话模型见过 chat template，add_generation_prompt=True 追加 “<|im_start|>assistant\n<think>…”，
+        #   告诉模型“轮到助手说话了”；open_thinking 决定是注入空 think 壳（直接回答）还是只开 <think>（先思考）。
         if 'pretrain' in args.weight:
             inputs = tokenizer.bos_token + prompt
         else:
@@ -86,6 +99,9 @@ def main():
 
         print('🧠: ', end='')
         st = time.time()
+        # temperature / top_p 的含义见 MiniMindForCausalLM.generate；streamer 在每生成一个 token 后被回调，
+        # 它会缓冲 token 并按词/字边界分段打印，而不是逐 token 直接 decode
+        # （逐 token 解码的问题见 train_tokenizer.eval_tokenizer 的流式解码测试）。
         generated_ids = model.generate(
             inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
             max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,

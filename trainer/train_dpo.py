@@ -1,8 +1,21 @@
-"""DPO 偏好优化入口：直接用 chosen/rejected 样本对训练策略模型。
+"""【阅读路线 第 6 站（下）】DPO 偏好优化入口：直接用 chosen/rejected 样本对训练策略模型。
 
-DPO（Direct Preference Optimization，直接偏好优化）把偏好标签转成策略
-概率的相对目标；它不需要单独训练奖励模型，但会用冻结 reference（参考策略）
-约束新策略不要偏离初始行为太远。
+从 SFT 到偏好优化，监督信号的形式变了：
+- SFT 告诉模型“标准答案是什么”（模仿单个示范）；
+- 偏好优化告诉模型“两个回答里哪个更好”（比较），这类数据更容易标注，也能表达
+  “都算通顺，但这个更有帮助/更安全”这种 SFT 难以表达的细微差别。
+
+经典 RLHF 的做法是：先用偏好对训练奖励模型，再用 PPO 优化策略（见第 7 站）。
+DPO（Direct Preference Optimization，直接偏好优化）证明了：在“最大化奖励 − β·KL(π‖π_ref)”这一目标下，
+最优策略与奖励之间存在闭式关系 r(x,y) = β·log(π(y|x)/π_ref(y|x)) + 常数。
+把它代入偏好模型（Bradley-Terry：P(y_w ≻ y_l) = σ(r_w − r_l)），就得到一个只依赖策略概率的损失：
+
+    L = −log σ( β · [ (log π(y_w) − log π_ref(y_w)) − (log π(y_l) − log π_ref(y_l)) ] )
+
+因此不需要单独的奖励模型、也不需要在线采样，训练循环就像 SFT 一样简单：
+只需一个被训练的 policy 和一个冻结的 reference（通常就是 SFT 模型本身）。
+
+阅读顺序：dataset/lm_dataset.py::DPODataset（数据）→ logits_to_log_probs → dpo_loss → train_epoch。
 """
 import os
 import sys
@@ -33,7 +46,8 @@ def logits_to_log_probs(logits, labels):
     # logits shape: (batch_size, seq_len, vocab_size)
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
-    # log_softmax 在词表维上归一化分数，并直接取对数以提高数值稳定性。
+    # log_softmax 在词表维上归一化分数，并直接取对数。它内部用 log-sum-exp 技巧
+    # （先减去最大值再求 exp），比先 softmax 再 log 更稳定，不会因概率极小而得到 log(0)=-inf。
     log_probs = F.log_softmax(logits, dim=2)
     # gather 按 labels 指定的 token id 从每个位置的 V 维分布中抽取一个值，
     # 输出 [batch, seq]：每个位置“模型给实际目标 token 的对数概率”。
@@ -42,13 +56,15 @@ def logits_to_log_probs(logits, labels):
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
-    # log probability（对数概率）把序列 token 概率的连乘换成求和。
-    # mask 只统计 assistant 回答，避免提示词长度影响偏好分数。
-    # preference pair（偏好对）是同一上下文的 chosen（较优）和 rejected（较差）回答。
-    # policy/reference 的 log-ratio 之差形成偏好 logit；beta 调节偏好目标的强度。
-    # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
-    # 对回答中有效 token 的 log-prob 求和，得到序列 log 概率；
-    # padding 和上下文位置的 mask 为 0，因此不计入回答似然。
+    # 输入：ref_log_probs / policy_log_probs 都是 [2B, L]（前 B 行 chosen，后 B 行 rejected），
+    # 每个元素是对应模型给“实际目标 token”的 log 概率；mask 同形状，1 表示该目标属于 assistant 回答。
+    #
+    # ① 序列 log 概率：log π(y|x) = Σ_t log π(y_t | x, y_<t)，概率的连乘在对数域变成求和。
+    #    mask 把 prompt 与 padding 位置排除：同一上下文的 prompt 部分在 chosen/rejected 中完全相同，
+    #    其 log-prob 在“chosen − rejected”的差值中本就会抵消；显式 mask 让分数只反映回答本身，
+    #    也去掉了 padding 带来的噪声。
+    #    注意这里是“求和”而不是“平均”：回答越长，序列 log 概率越负。因此 DPO 可能偏向改变长回答的概率，
+    #    这是文献中讨论的“长度偏差”问题（一些变体如 SimPO 改用长度归一化）。
     ref_log_probs = (ref_log_probs * mask).sum(dim=1)
     policy_log_probs = (policy_log_probs * mask).sum(dim=1)
 
@@ -59,12 +75,19 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
-    # policy 的 chosen-vs-rejected 差值，减去 reference 的同一差值：
-    # 如果 policy 比 reference 更偏向 chosen，logits 为正，sigmoid(beta*logits) 增大，
-    # 负对数损失随之下降。这就是偏好信号如何转成梯度的关键。
+    # ② 偏好 logit：policy 的 (chosen − rejected) 差值，减去 reference 的同一差值。
+    #    等价的读法：β·(log π(y_w)/π_ref(y_w)) 是 chosen 的“隐式奖励”，rejected 同理，
+    #    logits 就是两者隐式奖励之差（除以 β）。
+    #    训练开始时 policy == reference，logits = 0，loss = −log σ(0) = log 2 ≈ 0.693，这是 DPO loss 的典型起点。
+    # ③ loss = −log σ(β·logits)：如果 policy 比 reference 更偏向 chosen，logits 为正，σ 增大，loss 下降。
+    #    梯度会同时“推高 chosen 的概率、压低 rejected 的概率”，并且在模型已经排对序（σ 接近 1）时自动变小，
+    #    对还排错的样本梯度更大。
+    # β 的作用：它是推导中 KL 约束的系数。β 越大，只需较小的概率变化就能让 σ(β·logits) 饱和，
+    #    策略因此停留在 reference 附近（约束更强）；β 越小，策略需要偏离更多才能降低 loss（约束更弱）。
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
     logits = pi_logratios - ref_logratios
+    # logsigmoid 比 log(sigmoid(x)) 数值更稳定（x 很负时不会得到 log(0)）。
     loss = -F.logsigmoid(beta * logits)
     return loss.mean()
 
@@ -80,6 +103,8 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         y_rejected = batch['y_rejected'].to(args.device)
         mask_chosen = batch['mask_chosen'].to(args.device)
         mask_rejected = batch['mask_rejected'].to(args.device)
+        # 把 chosen 与 rejected 在 batch 维拼接成 [2B, L]，一次前向同时算完两组，
+        # 比分两次前向更高效；dpo_loss 再按“前一半/后一半”拆开，第 i 行与第 B+i 行是同一偏好对。
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
@@ -90,7 +115,8 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
 
         with autocast_ctx:
             # reference 冻结且不求梯度；policy 才接收偏好损失的梯度。
-            # chosen/rejected 在 batch 维拼接，前半与后半顺序由 dpo_loss 对应拆开。
+            # 这里 x/y 已在数据集中错位好，所以直接用完整 logits 与 y 逐位对齐，不再切 [:-1]。
+            # 显存提示：DPO 每步要跑两个模型、且序列数翻倍，[2B, L, V] 的 logits 往往是显存大头。
             with torch.no_grad():
                 ref_outputs = ref_model(x)
                 ref_logits = ref_outputs.logits
@@ -196,6 +222,8 @@ if __name__ == "__main__":
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     Logger(f'策略模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M')
     # 初始化参考模型（ref_model冻结）
+    # policy 与 reference 从同一份权重（默认 full_sft）加载：起点完全相同，所以初始 DPO loss = log 2。
+    # 训练中 reference 始终不变，充当“别偏离 SFT 模型太远”的锚点。
     ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
     ref_model.eval()
     ref_model.requires_grad_(False)

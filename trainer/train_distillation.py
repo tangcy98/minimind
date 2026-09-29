@@ -1,7 +1,16 @@
-"""知识蒸馏训练入口：学生模型同时学习真实标签与教师输出分布。
+"""【阅读路线 第 6 站（上）】知识蒸馏训练入口：学生模型同时学习真实标签与教师输出分布。
 
-Teacher（教师）是提供目标分布的强模型，student（学生）是被优化的小模型；
-教师只做前向推理，不参与梯度更新。
+与 SFT 的对比是理解蒸馏的关键：
+- SFT 的监督信号是“硬标签”：每个位置只告诉模型“正确答案是 token X”（one-hot 分布）；
+- 蒸馏额外使用教师的“软标签”：教师对整个词表的概率分布。例如教师认为下一个词
+  “猫”0.6、“狗”0.3、“车”0.001——这里面包含了“猫和狗是相近概念”的信息（常称 dark knowledge），
+  学生拟合整个分布，比只看 one-hot 标签获得的信息量更大、梯度信号也更平滑。
+
+Teacher（教师）是提供目标分布的强模型（默认示例是 MoE 模型），student（学生）是被优化的模型；
+教师只做前向推理，不参与梯度更新。本实现要求两者使用同一个 tokenizer（词表 id 一一对应），
+否则两个分布的第 i 维根本不是同一个 token，无法逐维比较。
+
+训练目标：loss = alpha · CE(学生, 真实标签) + (1-alpha) · T² · KL(教师_T ‖ 学生_T)
 """
 import os
 import sys
@@ -28,21 +37,29 @@ warnings.filterwarnings('ignore')
 
 
 def distillation_loss(student_logits, teacher_logits, temperature=1.0, reduction='batchmean'):
-    # 蒸馏让学生拟合教师的“软分布”，而非只看正确 token 的硬标签。
-    # 温度越高分布越平滑；乘 T² 用于抵消温度对梯度尺度的影响。
+    # 输入：student_logits / teacher_logits 形状都是 [N, V]，N 是被选中参与蒸馏的 token 数（已按 mask 筛选）。
+    # 温度 T：logits 先除以 T 再 softmax。T>1 让分布更平滑，放大教师给“非正确 token”的小概率，
+    # 使这些暗知识在 loss 中更显著；T=1 就是原始分布。
     with torch.no_grad():
         # soft target（软目标）是教师对整个词表的概率分布，而不只是正确 token。
-        # detach 截断梯度，确保教师只提供固定监督信号。
+        # no_grad + detach 截断梯度，确保教师只提供固定监督信号。
         teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
 
     student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
 
-    # KL 散度衡量两个概率分布的差异；训练目标让学生分布靠近教师分布。
+    # F.kl_div 的参数约定容易踩坑：第一个参数必须是“学生的 log 概率”，第二个参数是“教师的概率”，
+    # 它计算的是 Σ_v p_teacher(v)·(log p_teacher(v) - log p_student(v)) = KL(教师 ‖ 学生)，
+    # 即“前向 KL”：在教师概率大的地方，学生概率不能小（mode-covering，倾向于覆盖教师的所有高概率词）。
+    # reduction='batchmean' 表示对 N 个 token 求和后除以 N，得到“每个 token 的平均 KL”，
+    # 这才是数学上正确的 KL 均值（'mean' 会再多除一个 V）。
+    # 由于教师熵是常数，最小化该 KL 等价于最小化“以教师分布为目标的交叉熵”。
     kl = F.kl_div(
         student_log_probs,
         teacher_probs,
         reduction=reduction
     )
+    # 乘 T²：softmax(z/T) 对 z 的梯度大约按 1/T² 缩小，乘回 T² 让软目标部分的梯度量级不随温度变化，
+    # 从而 alpha 对 CE 与 KL 的配比在不同温度下保持可比（Hinton 等人 2015 的做法）。
     return (temperature ** 2) * kl
 
 
@@ -56,20 +73,24 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        # 与模型内部同样的错位规则：labels[1:] 对应 logits[:-1]。
+        # loss_mask=[B,S-1]，1 表示该位置的目标是 assistant token（SFTDataset 的 -100 之外）。
         loss_mask = (labels[..., 1:] != -100).float()
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        # 前向传播（学生模型）
+        # 前向传播（学生模型）。不传 labels：这里需要原始 logits 自己算两种 loss，而不是模型内置的 CE。
         with autocast_ctx:
             res = model(input_ids)
             student_logits = res.logits[..., :-1, :].contiguous()
 
-        # 教师模型前向传播（只在eval & no_grad）
+        # 教师模型前向传播（只在eval & no_grad）：不建计算图、不存激活，显存开销只有教师参数 + 一次前向。
+        # 注意教师前向在 autocast 之外，以 fp32 计算。
         if teacher_model is not None:
             with torch.no_grad():
                 teacher_logits = teacher_model(input_ids).logits[..., :-1, :].contiguous()
+                # 若教师词表更大（例如末尾多了扩展 token），截到学生的词表大小，保证逐维对应。
                 vocab_size_student = student_logits.size(-1)
                 teacher_logits = teacher_logits[..., :vocab_size_student]
 
@@ -86,11 +107,13 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             ignore_index=-100,
             reduction='none'
         )
+        # reduction='none' 得到逐 token 的 CE，再手动按 mask 求平均；结果与模型内置 CE（ignore_index + mean）等价。
         ce_loss_raw = torch.sum(ce_loss * loss_mask_flat) / (loss_mask_flat.sum() + 1e-8)
         if lm_config_student.use_moe: ce_loss = ce_loss_raw + res.aux_loss
         else: ce_loss = ce_loss_raw
 
         # 2) Distillation Loss
+        # 把 [B,S-1,V] 摊平成 [B·(S-1),V]，再用布尔索引只保留 assistant 位置，得到 [N,V] 送入 KL。
         if teacher_model is not None:
             distill_loss = distillation_loss(
                 student_logits.view(-1, student_logits.size(-1))[loss_mask_flat == 1],
@@ -101,6 +124,7 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             distill_loss = torch.tensor(0.0, device=args.device)
 
         # 3) 总损失 = alpha * CE + (1-alpha) * Distill
+        # alpha=1 退化为普通 SFT；alpha=0 为纯蒸馏。之后的反传/累积/裁剪/更新与预训练相同。
         loss = (alpha * ce_loss + (1 - alpha) * distill_loss) / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -209,6 +233,8 @@ if __name__ == "__main__":
     model, tokenizer = init_model(lm_config_student, args.from_student_weight, device=args.device)
     Logger(f'学生模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M')
     teacher_model, _ = init_model(lm_config_teacher, args.from_teacher_weight, device=args.device)
+    # eval()：关闭 dropout、让 MoE 不计算 aux_loss；requires_grad_(False)：参数不产生梯度。
+    # 教师不交给优化器、也不做 DDP 包装，每张卡各自持有一份只读副本。
     teacher_model.eval()
     teacher_model.requires_grad_(False)
     Logger(f'教师模型总参数量：{sum(p.numel() for p in teacher_model.parameters()) / 1e6:.3f} M')

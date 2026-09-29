@@ -1,7 +1,15 @@
-"""LoRA 微调训练入口：冻结预训练主干，只优化插入的低秩适配参数。
+"""【阅读路线 第 5 站（下）】LoRA 微调训练入口：冻结基础模型，只优化插入的低秩适配参数。
 
-LoRA（Low-Rank Adaptation，低秩适配）用两个较小矩阵的乘积近似权重增量，
-以较少可训练参数适配新任务。训练数据和 next-token 目标仍沿用 SFT。
+先读 model/model_lora.py 了解 LoRA 模块本身。本文件与 train_full_sft.py 相比只有三处关键差异：
+1. init_model 之后调用 apply_lora 给方阵线性层挂上 A/B 分支；
+2. 按参数名把非 LoRA 参数全部 requires_grad=False（冻结），并且优化器只接收 LoRA 参数；
+3. 保存时 save_lora 只写 A/B 的小文件。
+训练数据（SFTDataset）和 next-token 目标都与 SFT 相同；默认从 full_sft 权重出发，
+在领域数据（如医疗问答）上做轻量适配。学习率通常比全参 SFT 大（默认 1e-4），
+因为 B 从 0 起步、可训练参数少，需要更大步长才能学到有效增量。
+
+冻结究竟省了什么：被冻结的参数不产生 .grad、不需要 AdamW 的 m/v 状态，这部分显存大幅下降；
+但前向激活仍需保存，反向时梯度仍要穿过冻结层传到更浅层的 LoRA 参数，所以计算量省得并不多。
 """
 import os
 import sys
@@ -46,6 +54,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
         if step % args.accumulation_steps == 0 or step == iters:
             scaler.unscale_(optimizer)
+            # 只对 LoRA 参数裁剪：冻结参数的 .grad 为 None，本就不参与范数计算。
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
@@ -65,7 +74,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             lora_save_path = f'{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}{moe_suffix}.pth'
-            # LoRA只保存LoRA权重
+            # LoRA只保存LoRA权重（推理时 = 基础权重 + 此 adapter）；
+            # 下面的 lm_checkpoint 则保存含基础权重在内的完整 state_dict，仅用于续训。
             save_lora(model, lora_save_path)
             lm_checkpoint(lm_config, weight=args.lora_name, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
@@ -134,6 +144,8 @@ if __name__ == "__main__":
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
     
     # 冻结非LoRA参数，收集LoRA参数
+    # requires_grad=False 的参数在 autograd 中被视为常量：backward 不为它们计算/存储梯度。
+    # 优化器也只拿到 lora_params，所以基础权重在整个训练中保持与 full_sft 完全一致。
     lora_params = []
     for name, param in model.named_parameters():
         if 'lora' in name:
@@ -151,6 +163,7 @@ if __name__ == "__main__":
     # ========== 7. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
+        # 此时模型已挂上 LoRA，resume 文件中的 “...lora.A/B” 键能对上；strict=False 兼容少量键差异。
         model.load_state_dict(ckp_data['model'], strict=False)
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])
